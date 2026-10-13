@@ -90,6 +90,7 @@ python ml/generate_forecast.py
 | `POST` | `/api/products/` | Create new product (initial stock 0) |
 | `GET` | `/api/products/{sku}/` | Product detail by SKU |
 | `PATCH` | `/api/products/{sku}/` | Partial product update (immutable SKU) |
+| `GET` | `/api/inventory/summary/` | Live catalogue inventory aggregation (total units, unique SKUs, stock health, valuation) |
 | `PUT` | `/api/inventory/{sku}/` | Update live inventory count |
 | `GET` | `/api/dealers/` | Paginated dealer list |
 | `POST` | `/api/dealers/` | Create dealer account (unique `dealer_code`) |

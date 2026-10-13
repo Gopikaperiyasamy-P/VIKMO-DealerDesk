@@ -79,6 +79,19 @@ class CoreBackendTests(TestCase):
         self.p1.refresh_from_db()
         self.assertEqual(self.p1.stock, 75)
 
+    def test_inventory_summary(self):
+        r = self.client.get("/api/inventory/summary/")
+        self.assertEqual(r.status_code, status.HTTP_200_OK)
+        b = r.json()
+        self.assertIn("total_stock_units", b)
+        self.assertIn("unique_products", b)
+        self.assertIn("in_stock_products", b)
+        self.assertIn("low_stock_products", b)
+        self.assertIn("out_of_stock_products", b)
+        self.assertIn("inventory_value", b)
+        self.assertEqual(b["unique_products"], 2)
+        self.assertEqual(b["total_stock_units"], 150)
+
     def test_order_creation_pricing_and_gst(self):
         r = self.client.post("/api/orders/", {
             "dealer_id": self.dealer.id,

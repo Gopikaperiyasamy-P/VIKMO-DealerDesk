@@ -1,5 +1,5 @@
 from decimal import Decimal
-from django.db.models import Q
+from django.db.models import Count, DecimalField, F, Q, Sum
 from django.http import JsonResponse
 from rest_framework import status
 from rest_framework.decorators import api_view
@@ -52,6 +52,18 @@ class ProductListView(APIView):
         vehicle = request.query_params.get("vehicle")
         if vehicle:
             qs = qs.filter(vehicle_fitment__icontains=vehicle)
+
+        stock_status = request.query_params.get("stock_status")
+        if stock_status == "in_stock":
+            qs = qs.filter(stock__gt=10)
+        elif stock_status == "low_stock":
+            qs = qs.filter(stock__gte=1, stock__lte=10)
+        elif stock_status == "out_of_stock":
+            qs = qs.filter(stock=0)
+
+        ordering = request.query_params.get("ordering")
+        if ordering in ["stock", "-stock", "price", "-price", "sku", "-sku", "name", "-name"]:
+            qs = qs.order_by(ordering)
 
         paginator = self.pagination_class()
         page = paginator.paginate_queryset(qs, request)
@@ -182,6 +194,39 @@ class InventoryUpdateView(APIView):
         InventoryLog.objects.create(product=product, quantity=qty, reason=str(reason))
 
         return Response({"sku": product.sku, "quantity": product.stock})
+
+
+class InventorySummaryView(APIView):
+    def get(self, request):
+        agg = Product.objects.aggregate(
+            total_stock_units=Sum("stock"),
+            unique_products=Count("sku"),
+            in_stock_products=Count("sku", filter=Q(stock__gt=10)),
+            low_stock_products=Count("sku", filter=Q(stock__gte=1, stock__lte=10)),
+            out_of_stock_products=Count("sku", filter=Q(stock=0)),
+            inventory_val=Sum(
+                F("stock") * F("price"),
+                output_field=DecimalField(max_digits=16, decimal_places=2),
+            ),
+        )
+        total_units = agg["total_stock_units"] or 0
+        unique_prods = agg["unique_products"] or 0
+        in_stock = agg["in_stock_products"] or 0
+        low_stock = agg["low_stock_products"] or 0
+        out_of_stock = agg["out_of_stock_products"] or 0
+        val = agg["inventory_val"] or Decimal("0.00")
+
+        return Response(
+            {
+                "total_stock_units": total_units,
+                "unique_products": unique_prods,
+                "in_stock_products": in_stock,
+                "low_stock_products": low_stock,
+                "out_of_stock_products": out_of_stock,
+                "inventory_value": f"{val:.2f}",
+                "missing_inventory_products": 0,
+            }
+        )
 
 
 class DealerListView(APIView):

@@ -39,14 +39,14 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "check_stock",
-            "description": "Check current live stock and price for one or more product SKUs directly from the database.",
+            "description": "Check current live stock and price for one or more product SKUs directly from PostgreSQL database. Pass empty list [] or omit skus to retrieve total catalogue stock summary and counts.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "skus": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "List of SKU codes (e.g. ['BRK-1044', 'OIL-1001'])."
+                        "description": "List of SKU codes (e.g. ['BRK-1044', 'OIL-1001']). Pass empty list [] to retrieve overall catalogue stock aggregate summary."
                     }
                 },
                 "required": ["skus"]
@@ -154,13 +154,35 @@ def execute_search_parts(query: str, vehicle: str = None, category: str = None) 
 
 
 def execute_check_stock(skus: Any) -> List[Dict[str, Any]]:
-    """Check live stock and price for requested SKUs from PostgreSQL."""
+    """Check live stock and price for requested SKUs from PostgreSQL, or catalogue aggregation if empty."""
     if isinstance(skus, str):
         skus = [skus]
     if not isinstance(skus, list):
-        return []
+        skus = []
 
-    clean_skus = [str(s).strip() for s in skus]
+    clean_skus = [str(s).strip() for s in skus if str(s).strip() and str(s).strip().lower() != "all"]
+    if not clean_skus:
+        # Full catalogue summary aggregation
+        from django.db.models import Sum, Count, Q, F, DecimalField
+        agg = Product.objects.aggregate(
+            total_stock_units=Sum("stock"),
+            unique_products=Count("sku"),
+            in_stock_products=Count("sku", filter=Q(stock__gt=10)),
+            low_stock_products=Count("sku", filter=Q(stock__gte=1, stock__lte=10)),
+            out_of_stock_products=Count("sku", filter=Q(stock=0)),
+            inventory_val=Sum(F("stock") * F("price"), output_field=DecimalField(max_digits=16, decimal_places=2))
+        )
+        return [{
+            "summary": True,
+            "total_stock_units": agg["total_stock_units"] or 0,
+            "unique_products": agg["unique_products"] or 0,
+            "in_stock_products": agg["in_stock_products"] or 0,
+            "low_stock_products": agg["low_stock_products"] or 0,
+            "out_of_stock_products": agg["out_of_stock_products"] or 0,
+            "missing_inventory_products": 0,
+            "inventory_value": f"{agg['inventory_val'] or Decimal('0.00'):.2f}",
+        }]
+
     products = Product.objects.filter(sku__in=clean_skus)
     results = []
     for p in products:
@@ -393,6 +415,77 @@ def run_fallback_agent(message: str, dealer_id: int):
     if any(topic in msg_lower for topic in ["poem", "python script", "recipe", "weather", "write a story", "capital of"]):
         reply = "I apologize, but I am an automotive parts desk assistant. I can only assist with catalogue parts, stock availability, and draft orders."
         return reply, tool_calls, actions, tool_results
+
+    # Check for total live stock or inventory summary inquiry
+    if re.search(r"\b(total (?:live )?stock|how many total|overall stock|stock units|inventory summary|catalogue stock|total units|live stock available)\b", msg_lower):
+        tc = {"name": "check_stock", "arguments": {"skus": []}}
+        tool_calls.append(tc)
+        res = execute_check_stock([])
+        tool_results.append(res)
+        summary = res[0]
+        reply = (
+            f"Across our entire catalogue of {summary['unique_products']} unique products, there are currently "
+            f"{summary['total_stock_units']:,} total live stock units available in the warehouse "
+            f"(Total Inventory Valuation: ₹{float(summary['inventory_value']):,.2f}).\n\n"
+            f"Inventory Breakdown:\n"
+            f"• In-Stock Products (>10 units): {summary['in_stock_products']} SKUs\n"
+            f"• Low-Stock Products (1-10 units): {summary['low_stock_products']} SKUs\n"
+            f"• Out-of-Stock Products (0 units): {summary['out_of_stock_products']} SKUs\n"
+            f"• Missing Inventory Data: {summary['missing_inventory_products']} SKUs"
+        )
+        return reply, tool_calls, actions, tool_results
+
+    # Check for low-stock products inquiry
+    if re.search(r"\b(low stock|running low|critical stock|few items left)\b", msg_lower):
+        low_prods = list(Product.objects.filter(stock__gte=1, stock__lte=10).order_by("stock")[:5])
+        low_skus = [p.sku for p in low_prods]
+        tc = {"name": "check_stock", "arguments": {"skus": low_skus}}
+        tool_calls.append(tc)
+        res = execute_check_stock(low_skus)
+        tool_results.append(res)
+        items_str = "\n".join([f"• {p['name']} ({p['sku']}): {p['stock']} remaining @ ₹{p['price']} (Fitment: {p['vehicle_fitment']})" for p in res])
+        reply = f"Here are the most critical low-stock products (1-10 units remaining):\n\n{items_str}\n\nWould you like me to create a draft order for any of these?"
+        return reply, tool_calls, actions, tool_results
+
+    # Check for reorder inquiry
+    if re.search(r"\b(reorder|reordering|replenish|replenishment)\b", msg_lower):
+        try:
+            from core.forecast_service import get_reorder_suggestions
+            suggestions = get_reorder_suggestions()
+            needed = [s for s in suggestions.get("results", []) if s.get("reorder_qty", 0) > 0][:5]
+            if needed:
+                reorder_skus = [s["sku"] for s in needed]
+                tc = {"name": "check_stock", "arguments": {"skus": reorder_skus}}
+                tool_calls.append(tc)
+                res = execute_check_stock(reorder_skus)
+                tool_results.append(res)
+                lines = []
+                for s in needed:
+                    lines.append(f"• {s['sku']}: Current stock {s['current_stock']} | Lead time {s['lead_time_weeks']}w | Reorder point {s['reorder_point']} | Suggested reorder: {s['reorder_qty']} units")
+                reply = "Based on our 4-week demand forecast and supplier lead times, here are the top priority reorder recommendations:\n\n" + "\n".join(lines)
+                return reply, tool_calls, actions, tool_results
+        except Exception:
+            pass
+
+    # Check for forecasting inquiry
+    if re.search(r"\bforecast\b", msg_lower):
+        f_sku = re.search(r"\b([A-Z]{3}-\d{4})\b", message)
+        if f_sku:
+            target_sku = f_sku.group(1).upper()
+            try:
+                from core.forecast_service import get_sku_forecast
+                fdata = get_sku_forecast(target_sku)
+                tc = {"name": "check_stock", "arguments": {"skus": [target_sku]}}
+                tool_calls.append(tc)
+                res = execute_check_stock([target_sku])
+                tool_results.append(res)
+                weeks_str = ", ".join([f"{w['week_start']}: {w['forecast_units']} units" for w in fdata.get("forecast", [])])
+                reply = f"Demand forecast for {target_sku} across the next 4 weeks:\n{weeks_str}."
+                if res:
+                    reply += f"\nCurrent live stock is {res[0]['stock']} units @ ₹{res[0]['price']}."
+                return reply, tool_calls, actions, tool_results
+            except Exception:
+                pass
 
     # Check for order creation intent: e.g. "order 2 of BRK-1044", "create draft order for ..."
     order_match = re.search(r"\b(?:order|draft order|buy|put aside|reserve)\s+(\d+)\s*(?:of|x|units of)?\s*([A-Z]{3}-\d{4})\b", message, re.IGNORECASE)

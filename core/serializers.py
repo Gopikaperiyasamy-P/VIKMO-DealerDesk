@@ -11,6 +11,7 @@ def format_money(val) -> str:
 
 class ProductSerializer(serializers.ModelSerializer):
     price = serializers.SerializerMethodField()
+    inventory_value = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
@@ -22,11 +23,16 @@ class ProductSerializer(serializers.ModelSerializer):
             "vehicle_fitment",
             "price",
             "stock",
+            "inventory_value",
             "description",
         ]
 
     def get_price(self, obj):
         return format_money(obj.price)
+
+    def get_inventory_value(self, obj):
+        val = (Decimal(str(obj.price)) * obj.stock).quantize(Decimal("0.01"))
+        return format_money(val)
 
 
 class ProductCreateSerializer(serializers.ModelSerializer):
